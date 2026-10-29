@@ -60,9 +60,8 @@ html, body, .stApp, [class*="css"], button, input, textarea, select {
 .stApp, .stApp p, .stApp span, .stApp label, .stApp li, .stApp div { color: #4A4A4A; }
 h1, h2, h3, h4, h5 { color: #6B4E71 !important; font-weight: 700 !important; }
 
-/* Hide Streamlit chrome (header kept transparent so the sidebar toggle works on phones) */
-#MainMenu, footer, [data-testid="stToolbar"], [data-testid="stDecoration"],
-[data-testid="stStatusWidget"], [data-testid="stAppDeployButton"] { display: none !important; }
+/* Hide Streamlit chrome */
+#MainMenu, footer, [data-testid="stDecoration"], [data-testid="stAppDeployButton"] { display: none !important; }
 header[data-testid="stHeader"] { background: transparent !important; }
 .block-container { padding-top: 1.6rem; padding-bottom: 4rem; max-width: 1150px; }
 
@@ -826,20 +825,22 @@ def page_sos():
 
 
 # ----------------------------------------------------------------------------
-# Navigation
+# Navigation (Mobile Optimized)
 # ----------------------------------------------------------------------------
-with st.sidebar:
-    st.markdown("# 🌸 StudyOS")
-    st.caption("your cozy study corner ☁️")
-    page = st.radio("Navigate", PAGES, label_visibility="collapsed")
-    st.markdown("---")
-    st.caption("You're doing great 🤍")
+st.sidebar.markdown("# 🌸 StudyOS")
+st.sidebar.caption("your cozy study corner ☁️")
 
-{
-    "🏠 Dashboard": page_dashboard,
-    "📅 Schedule Setup": page_schedule,
-    "🤖 AI Bestie": page_bestie,
-    "⏳ Focus Room": page_focus,
-    "☁️ Brain Dump": page_dump,
-    "🚨 SOS Exam Mode": page_sos,
-}[page]()
+# استخدام نظام التنقل الحديث لتجربة موبايل مثالية (يغلق القائمة تلقائياً بعد الاختيار)
+pg = st.navigation([
+    st.Page(page_dashboard, title="🏠 Dashboard"),
+    st.Page(page_schedule, title="📅 Schedule Setup"),
+    st.Page(page_bestie, title="🤖 AI Bestie"),
+    st.Page(page_focus, title="⏳ Focus Room"),
+    st.Page(page_dump, title="☁️ Brain Dump"),
+    st.Page(page_sos, title="🚨 SOS Exam Mode"),
+])
+
+st.sidebar.markdown("---")
+st.sidebar.caption("You're doing great 🤍")
+
+pg.run()
