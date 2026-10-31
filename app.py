@@ -1,20 +1,23 @@
 """
 StudyOS 🌸 — Notion-style study workspace
-Stack: Python, Streamlit (>=1.40), SQLite3, Groq API (llama-3.1-8b-instant)
+Stack: Python, Streamlit (>=1.40), PostgreSQL (psycopg2), Groq API (llama-3.1-8b-instant)
 
 Run:      streamlit run app.py
-API key:  .streamlit/secrets.toml  ->  GROQ_API_KEY = "gsk_..."
+Secrets:  .streamlit/secrets.toml  ->  GROQ_API_KEY = "gsk_..."
+                                       DATABASE_URL = "postgresql://user:pass@host:5432/dbname"
 """
 
 import os
 import re
-import sqlite3
 from contextlib import contextmanager
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
 import pandas as pd
+import psycopg2
+import psycopg2.extras
 import streamlit as st
+from psycopg2.pool import ThreadedConnectionPool
 import streamlit.components.v1 as components
 
 st.set_page_config(page_title="StudyOS 🌸", page_icon="🌸", layout="wide",
@@ -23,8 +26,7 @@ st.set_page_config(page_title="StudyOS 🌸", page_icon="🌸", layout="wide",
 # ----------------------------------------------------------------------------
 # Constants
 # ----------------------------------------------------------------------------
-DB_PATH = "studyos.db"
-TZ = ZoneInfo("Africa/Cairo")
+TZ =ZoneInfo("Africa/Cairo")
 MODEL = "llama-3.1-8b-instant"
 
 DAYS = ["Saturday", "Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday"]
@@ -150,68 +152,119 @@ st.markdown(BASE_CSS, unsafe_allow_html=True)
 
 
 # ----------------------------------------------------------------------------
-# Database
+# Database (PostgreSQL via psycopg2 + a small shared connection pool)
 # ----------------------------------------------------------------------------
+def get_db_url():
+    try:
+        url = st.secrets["DATABASE_URL"]
+        if url:
+            return url
+    except Exception:
+        pass
+    return os.environ.get("DATABASE_URL")
+
+
+@st.cache_resource(show_spinner=False)
+def get_pool(url: str) -> ThreadedConnectionPool:
+    """One small pool per server process, shared by every session."""
+    return ThreadedConnectionPool(
+        1, 5, dsn=url, connect_timeout=10,
+        keepalives=1, keepalives_idle=30, keepalives_interval=10, keepalives_count=3)
+
+
+def _checkout():
+    """Borrow a live connection. Cloud Postgres drops idle connections, so ping first
+    and silently replace any dead one."""
+    pool = get_pool(get_db_url())
+    last_err = None
+    for _ in range(3):
+        conn = pool.getconn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            conn.rollback()
+            return pool, conn
+        except psycopg2.Error as e:
+            last_err = e
+            pool.putconn(conn, close=True)
+    raise last_err
+
+
 @contextmanager
 def db():
-    conn = sqlite3.connect(DB_PATH)
-    conn.row_factory = sqlite3.Row
+    """Yields a dict-row cursor; commits on success, rolls back on error."""
+    pool, conn = _checkout()
     try:
-        yield conn
+        with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
+            yield cur
         conn.commit()
+    except Exception:
+        try:
+            conn.rollback()
+        except psycopg2.Error:
+            pass
+        raise
     finally:
-        conn.close()
+        pool.putconn(conn, close=bool(conn.closed))
 
 
+SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS weekly_schedule (
+        id SERIAL PRIMARY KEY,
+        day TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
+        title TEXT NOT NULL, kind TEXT NOT NULL DEFAULT '🏫 School'
+    )""",
+    """CREATE TABLE IF NOT EXISTS habits (
+        id SERIAL PRIMARY KEY,
+        date TEXT NOT NULL, name TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
+        UNIQUE (date, name)
+    )""",
+    """CREATE TABLE IF NOT EXISTS todos (
+        id SERIAL PRIMARY KEY,
+        date TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'todo',   -- 'todo' | 'goal'
+        text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0
+    )""",
+    """CREATE TABLE IF NOT EXISTS journal (
+        id SERIAL PRIMARY KEY,
+        created_at TEXT NOT NULL, content TEXT NOT NULL, ai_reply TEXT
+    )""",
+]
+
+
+@st.cache_resource(show_spinner=False)
 def init_db():
+    """Creates the tables once per server process."""
     with db() as c:
-        c.executescript("""
-        CREATE TABLE IF NOT EXISTS weekly_schedule (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            day TEXT NOT NULL, start_time TEXT NOT NULL, end_time TEXT NOT NULL,
-            title TEXT NOT NULL, kind TEXT NOT NULL DEFAULT '🏫 School'
-        );
-        CREATE TABLE IF NOT EXISTS habits (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL, name TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0,
-            UNIQUE(date, name)
-        );
-        CREATE TABLE IF NOT EXISTS todos (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            date TEXT NOT NULL, kind TEXT NOT NULL DEFAULT 'todo',   -- 'todo' | 'goal'
-            text TEXT NOT NULL, done INTEGER NOT NULL DEFAULT 0
-        );
-        CREATE TABLE IF NOT EXISTS journal (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            created_at TEXT NOT NULL, content TEXT NOT NULL, ai_reply TEXT
-        );
-        """)
+        for stmt in SCHEMA:
+            c.execute(stmt)
+    return True
 
 
 # schedule
 def add_slot(day, start, end, title, kind):
     with db() as c:
-        c.execute("INSERT INTO weekly_schedule (day,start_time,end_time,title,kind) VALUES (?,?,?,?,?)",
+        c.execute("INSERT INTO weekly_schedule (day,start_time,end_time,title,kind) VALUES (%s,%s,%s,%s,%s)",
                   (day, start, end, title, kind))
 
 
 def update_slot(sid, day, start, end, title, kind):
     with db() as c:
-        c.execute("UPDATE weekly_schedule SET day=?,start_time=?,end_time=?,title=?,kind=? WHERE id=?",
+        c.execute("UPDATE weekly_schedule SET day=%s,start_time=%s,end_time=%s,title=%s,kind=%s WHERE id=%s",
                   (day, start, end, title, kind, sid))
 
 
 def delete_slot(sid):
     with db() as c:
-        c.execute("DELETE FROM weekly_schedule WHERE id=?", (sid,))
+        c.execute("DELETE FROM weekly_schedule WHERE id=%s", (sid,))
 
 
 def get_schedule(day=None):
     with db() as c:
         if day:
-            rows = c.execute("SELECT * FROM weekly_schedule WHERE day=? ORDER BY start_time", (day,)).fetchall()
+            c.execute("SELECT * FROM weekly_schedule WHERE day=%s ORDER BY start_time", (day,))
         else:
-            rows = c.execute("SELECT * FROM weekly_schedule").fetchall()
+            c.execute("SELECT * FROM weekly_schedule")
+        rows = c.fetchall()
     rows = [dict(r) for r in rows]
     if not day:
         rows.sort(key=lambda r: (DAYS.index(r["day"]) if r["day"] in DAYS else 99, r["start_time"]))
@@ -221,42 +274,45 @@ def get_schedule(day=None):
 # goal + todos
 def get_goal(d):
     with db() as c:
-        r = c.execute("SELECT text FROM todos WHERE date=? AND kind='goal'", (d,)).fetchone()
+        c.execute("SELECT text FROM todos WHERE date=%s AND kind='goal'", (d,))
+        r = c.fetchone()
     return r["text"] if r else ""
 
 
 def set_goal(d, text):
     with db() as c:
-        c.execute("DELETE FROM todos WHERE date=? AND kind='goal'", (d,))
+        c.execute("DELETE FROM todos WHERE date=%s AND kind='goal'", (d,))
         if text.strip():
-            c.execute("INSERT INTO todos (date,kind,text,done) VALUES (?,?,?,0)", (d, "goal", text.strip()))
+            c.execute("INSERT INTO todos (date,kind,text,done) VALUES (%s,%s,%s,0)", (d, "goal", text.strip()))
 
 
 def get_todos(d):
     with db() as c:
-        rows = c.execute("SELECT * FROM todos WHERE date=? AND kind='todo' ORDER BY id", (d,)).fetchall()
+        c.execute("SELECT * FROM todos WHERE date=%s AND kind='todo' ORDER BY id", (d,))
+        rows = c.fetchall()
     return [dict(r) for r in rows]
 
 
 def add_todo(d, text):
     with db() as c:
-        c.execute("INSERT INTO todos (date,kind,text,done) VALUES (?,?,?,0)", (d, "todo", text.strip()))
+        c.execute("INSERT INTO todos (date,kind,text,done) VALUES (%s,%s,%s,0)", (d, "todo", text.strip()))
 
 
 def toggle_todo(tid):
     with db() as c:
-        c.execute("UPDATE todos SET done = 1 - done WHERE id=?", (tid,))
+        c.execute("UPDATE todos SET done = 1 - done WHERE id=%s", (tid,))
 
 
 def delete_todo(tid):
     with db() as c:
-        c.execute("DELETE FROM todos WHERE id=?", (tid,))
+        c.execute("DELETE FROM todos WHERE id=%s", (tid,))
 
 
 # habits
 def get_habits(d):
     with db() as c:
-        rows = c.execute("SELECT name, done FROM habits WHERE date=?", (d,)).fetchall()
+        c.execute("SELECT name, done FROM habits WHERE date=%s", (d,))
+        rows = c.fetchall()
     state = {h: False for h in HABITS}
     state.update({r["name"]: bool(r["done"]) for r in rows})
     return state
@@ -264,29 +320,45 @@ def get_habits(d):
 
 def set_habit(d, name, done):
     with db() as c:
-        c.execute("INSERT INTO habits (date,name,done) VALUES (?,?,?) "
-                  "ON CONFLICT(date,name) DO UPDATE SET done=excluded.done", (d, name, int(done)))
+        c.execute("INSERT INTO habits (date,name,done) VALUES (%s,%s,%s) "
+                  "ON CONFLICT (date,name) DO UPDATE SET done=EXCLUDED.done", (d, name, int(done)))
 
 
 # journal
 def add_journal(content, reply):
     with db() as c:
-        c.execute("INSERT INTO journal (created_at,content,ai_reply) VALUES (?,?,?)",
+        c.execute("INSERT INTO journal (created_at,content,ai_reply) VALUES (%s,%s,%s)",
                   (now().strftime("%Y-%m-%d %H:%M"), content, reply))
 
 
 def get_journal(limit=12):
     with db() as c:
-        rows = c.execute("SELECT * FROM journal ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        c.execute("SELECT * FROM journal ORDER BY id DESC LIMIT %s", (limit,))
+        rows = c.fetchall()
     return [dict(r) for r in rows]
 
 
 def delete_journal(jid):
     with db() as c:
-        c.execute("DELETE FROM journal WHERE id=?", (jid,))
+        c.execute("DELETE FROM journal WHERE id=%s", (jid,))
 
 
-init_db()
+def boot_db():
+    """Fail with a friendly message (not a stack trace) if the database isn't reachable."""
+    if not get_db_url():
+        st.error("🌸 I can't find the database yet. Add `DATABASE_URL = \"postgresql://user:pass@host:5432/dbname\"` "
+                 "to `.streamlit/secrets.toml` (or the Secrets box on Streamlit Cloud) and reboot the app 🤍")
+        st.stop()
+    try:
+        init_db()
+    except Exception as e:
+        first_line = (str(e).strip().splitlines() or [type(e).__name__])[0]
+        st.error(f"☁️ I couldn't connect to the database ({type(e).__name__}: {first_line}). "
+                 "Please check `DATABASE_URL` in your secrets 🤍")
+        st.stop()
+
+
+boot_db()
 
 # ----------------------------------------------------------------------------
 # Session state
